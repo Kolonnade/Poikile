@@ -1,0 +1,32 @@
+# Normalize line endings on checkin; check out LF everywhere.
+* text=auto eol=lf
+
+# Source and docs
+*.go        text
+*.md        text
+*.sql       text
+*.sh        text
+*.html      text
+*.css       text
+*.js        text
+*.json      text
+*.yaml      text
+*.yml       text
+Makefile    text
+go.mod      text
+go.sum      text
+
+# Image fixtures: binary, never line-ending-mangled or diffed
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.gif   binary
+*.webp  binary
+*.heic  binary
+*.heif  binary
+*.avif  binary
+*.ico   binary
+*.pdf   binary
+
+# SVG is text and worth diffing
+*.svg   text
