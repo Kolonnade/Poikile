@@ -2,7 +2,9 @@
 
 Private photos and other assets on S3-compatible storage, served by your own Go app from a tiered in-memory cache.
 
-The painted colonnade of [Kolonnade](https://github.com/Kolonnade), spelled with a **K** like [Portiko](https://github.com/Kolonnade/Portiko). The Stoa Poikile in Athens was a public walkway hung with paintings; this library is where your pictures hang, behind a door only your app opens.
+The painted colonnade of [Kolonnade](https://github.com/Kolonnade). The Stoa Poikile in Athens was a public walkway hung with paintings; this library is where your pictures hang, behind a door only your app opens.
+
+Like [Portiko](https://github.com/Kolonnade/Portiko), the name carries a **K**. It makes the name unique, and the K stands for **key**, as in passkey: every picture here sits behind a sign-in that opens with one, through Portiko.
 
 > **Status: not started.** The packages are being moved here from a private prototype. Nothing is tagged.
 
