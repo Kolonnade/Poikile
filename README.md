@@ -31,7 +31,7 @@ Poikile never decides who may see an asset. Your app answers that through a reso
 - `meter` — storage and transfer counters (planned).
 - `assettest` — a conformance suite for `store` backends.
 
-Import path: not final yet.
+Import path: `github.com/Kolonnade/Poikile`.
 
 Import these; don't copy them. If you need something that isn't exported, open an issue asking for a public API.
 
