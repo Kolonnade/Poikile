@@ -20,6 +20,21 @@ Like [Portiko](https://github.com/Kolonnade/Portiko), the name carries a **K**. 
 
 Poikile never decides who may see an asset. Your app answers that through a resolver, and Poikile only serves what the resolver allows.
 
+## Packages
+
+- `store` — the storage interface, with `s3`, `memory` and `fs` backends.
+- `bucket` — one bucket per owner, created and named for you.
+- `upload` — pre-signed PUTs limited by type and size.
+- `process/image` — display sizes with private metadata removed.
+- `cache` — the two-tier in-memory LRU cache.
+- `serve` — an `http.Handler` that authorizes, caches and streams.
+- `meter` — storage and transfer counters.
+- `assettest` — a conformance suite for `store` backends.
+
+Import path: not final yet.
+
+Import these; don't copy them. If you need something that isn't exported, open an issue asking for a public API.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
