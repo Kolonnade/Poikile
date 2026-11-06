@@ -28,7 +28,7 @@ Poikile never decides who may see an asset. Your app answers that through a reso
 - `process/image` — display sizes with private metadata removed.
 - `cache` — the two-tier in-memory LRU cache.
 - `serve` — an `http.Handler` that authorizes, caches and streams.
-- `meter` — storage and transfer counters.
+- `meter` — storage and transfer counters (planned).
 - `assettest` — a conformance suite for `store` backends.
 
 Import path: not final yet.
