@@ -1,7 +1,7 @@
 // Package process runs the image pipeline against a store: read
 // incoming/<uploadID>, make each variant, put it under
 // <kind>/<assetID>/<variant>, then delete incoming. The original is
-// kept as uploaded.
+// re-encoded at full size, like every other variant.
 package process
 
 import (

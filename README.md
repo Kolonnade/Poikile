@@ -12,9 +12,9 @@ Like [Portiko](https://github.com/Kolonnade/Portiko), the name carries a **K**. 
 
 - **Store** originals and their web and mobile sizes on S3-compatible storage, one bucket per owner, with keys your database chooses. Nothing lists a bucket.
 - **Upload** through pre-signed PUTs limited to images and to a size.
-- **Process** the original into display sizes with private metadata removed, keeping the original untouched.
+- **Process** the original into display sizes with private metadata removed, including a full-size original re-encoded without its metadata.
 - **Serve** every byte through your app after it authorizes the request, from two LRU caches (recent and older) so browsing old photos never evicts new ones.
-- **Sign in** with passkeys through an optional Portiko adapter. The core doesn't depend on Portiko.
+- **Sign in** with passkeys through an optional Portiko adapter (planned). The core doesn't depend on Portiko.
 
 ## What it does not do
 
@@ -53,7 +53,7 @@ Import these; don't copy them. If you need something that isn't exported, open a
 
 `go test ./...` runs everything that needs no network. The S3 conformance test runs only when `TEST_S3_PROFILE` names an AWS profile; `TEST_S3_REGION` (default `us-east-1`) and `TEST_S3_BUCKET_PREFIX` (default `poikile-test-`) set where it creates its temporary bucket.
 
-HEIF decoding needs libheif and the `heif` build tag: `go test -tags heif ./...`.
+HEIF decoding needs libheif and the `heif` build tag: `go test -tags heif ./...`. The HEIC test reads `process/image/testdata/sample.heic` and skips without it; make one with `heif-enc`.
 
 ## License
 
