@@ -114,3 +114,29 @@ func TestUploadMethod(t *testing.T) {
 		t.Fatalf("status = %d", code)
 	}
 }
+
+func TestUploadExactType(t *testing.T) {
+	p, _, _ := uploadSetup(t)
+	tg, err := p.SignUpload(context.Background(), bkt, upKey, upload.Limits{MaxBytes: 10, ContentType: "application/pdf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ct := range []string{"application/pdfx", "application/", "text/plain"} {
+		if code := do(t, "PUT", tg.URL, ct, "x"); code != http.StatusUnsupportedMediaType {
+			t.Errorf("%s: status = %d", ct, code)
+		}
+	}
+	u, _ := url.Parse(tg.URL)
+	q := u.Query()
+	q.Del("exact")
+	u.RawQuery = q.Encode()
+	if code := do(t, "PUT", u.String(), "application/pdfx", "x"); code != http.StatusForbidden {
+		t.Errorf("exact dropped: status = %d", code)
+	}
+	if code := do(t, "PUT", tg.URL, "application/pdf", "%PDF-"); code != http.StatusNoContent {
+		t.Fatalf("status = %d", code)
+	}
+	if _, info, err := get(t, p, upKey); err != nil || info.ContentType != "application/pdf" {
+		t.Fatalf("Get = %+v, %v", info, err)
+	}
+}

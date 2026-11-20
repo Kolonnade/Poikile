@@ -130,7 +130,12 @@ func Provider(t *testing.T, p store.Provider, o Options) {
 	})
 
 	lim := upload.Limits{MaxBytes: 64, ContentTypePrefix: "image/"}
+	var sendWith func(t *testing.T, lim upload.Limits, ct string, n int) (string, []byte, int)
 	send := func(t *testing.T, ct string, n int) (string, []byte, int) {
+		t.Helper()
+		return sendWith(t, lim, ct, n)
+	}
+	sendWith = func(t *testing.T, lim upload.Limits, ct string, n int) (string, []byte, int) {
 		t.Helper()
 		k := incomingKey(t)
 		tg, err := p.SignUpload(ctx, o.Bucket, k, lim)
@@ -183,6 +188,30 @@ func Provider(t *testing.T, p store.Provider, o Options) {
 			t.Errorf("status %d, want a refusal", status)
 		}
 		wantNotFound(t, ctx, p, o.Bucket, k)
+	})
+
+	t.Run("UploadExactType", func(t *testing.T) {
+		if !o.Uploads {
+			t.Skip("provider's upload targets are not served")
+		}
+		exact := upload.Limits{MaxBytes: 64, ContentType: "application/pdf"}
+		t.Logf("upload application/pdfx and text/plain against an exact application/pdf limit")
+		for _, ct := range []string{"application/pdfx", "text/plain"} {
+			k, _, status := sendWith(t, exact, ct, 32)
+			if status >= 200 && status <= 299 {
+				t.Errorf("%s: status %d, want a refusal", ct, status)
+			}
+			wantNotFound(t, ctx, p, o.Bucket, k)
+		}
+		t.Logf("upload application/pdf")
+		k, body, status := sendWith(t, exact, "application/pdf", 32)
+		if status < 200 || status > 299 {
+			t.Fatalf("status %d, want 2xx", status)
+		}
+		got, info := mustGet(t, ctx, p, o.Bucket, k)
+		if !bytes.Equal(got, body) || info.ContentType != "application/pdf" {
+			t.Errorf("Get %s: %d bytes of %q, want the upload as application/pdf", k, len(got), info.ContentType)
+		}
 	})
 
 	t.Run("OverwriteThenDelete", func(t *testing.T) {

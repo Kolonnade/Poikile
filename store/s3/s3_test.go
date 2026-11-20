@@ -261,6 +261,21 @@ func TestSignUploadPolicy(t *testing.T) {
 	}
 }
 
+func TestSignUploadExactType(t *testing.T) {
+	p, _, ps := newStub("")
+	lim := upload.Limits{MaxBytes: 100, ContentType: "application/pdf"}
+	if _, err := p.SignUpload(context.Background(), testBucket, "incoming/"+testUUID, lim); err != nil {
+		t.Fatal(err)
+	}
+	want := []any{
+		[]any{"content-length-range", 1, int64(100)},
+		[]any{"eq", "$Content-Type", "application/pdf"},
+	}
+	if !reflect.DeepEqual(ps.opts.Conditions, want) {
+		t.Fatalf("Conditions = %#v", ps.opts.Conditions)
+	}
+}
+
 func TestSignUploadRejects(t *testing.T) {
 	p, _, ps := newStub("")
 	if _, err := p.SignUpload(context.Background(), testBucket, "photos/"+testUUID+"/thumb", upload.Limits{MaxBytes: 10, ContentTypePrefix: "image/"}); err == nil {
