@@ -112,6 +112,20 @@ func Provider(t *testing.T, p store.Provider, o Options) {
 		}
 	})
 
+	t.Run("PutStream", func(t *testing.T) {
+		t.Logf("put 1 MiB from a reader that can't seek, as a copy streams")
+		k := objectKey(t)
+		data := randomBytes(t, 1<<20)
+		body := io.MultiReader(bytes.NewReader(data[:100]), bytes.NewReader(data[100:]))
+		if err := p.Put(ctx, o.Bucket, k, body, store.ObjectInfo{ContentType: "application/octet-stream", Size: int64(len(data))}); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+		got, info := mustGet(t, ctx, p, o.Bucket, k)
+		if !bytes.Equal(got, data) || info.Size != int64(len(data)) {
+			t.Errorf("Get %s: %d bytes (Size %d), want the 1 MiB put", k, len(got), info.Size)
+		}
+	})
+
 	t.Run("NotFoundAfterDelete", func(t *testing.T) {
 		t.Logf("delete, then get, and delete again")
 		k := objectKey(t)

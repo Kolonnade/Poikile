@@ -1,7 +1,13 @@
-// Package process runs the image pipeline against a store: read
-// incoming/<uploadID>, make each variant, put it under
+// Package process turns an upload into what is stored. Pipeline runs the
+// image pipeline: read incoming/<uploadID>, make each variant, put it under
 // <kind>/<assetID>/<variant>, then delete incoming. The original is
 // re-encoded at full size, like every other variant.
+//
+// StoreFile is for files: it checks the upload's size, sniffs its leading
+// bytes, and copies it unchanged to <kind>/<assetID>/file, to be served
+// only as an attachment (README rule 6). Run StoreFile with KeepIncoming
+// and then Pipeline.Run to keep an image's exact bytes as well as its
+// variants.
 package process
 
 import (
