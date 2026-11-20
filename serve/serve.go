@@ -6,12 +6,15 @@ package serve
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kolonnade/Poikile/cache"
 	"github.com/Kolonnade/Poikile/store"
@@ -19,7 +22,7 @@ import (
 
 // Asset is one stored variant the Resolver has authorized for a request.
 // The cache key is Bucket + "/" + Key; deletion must Cache.Remove that same
-// key.
+// key (Delete does).
 type Asset struct {
 	ID          string
 	Owner       string
@@ -30,6 +33,14 @@ type Asset struct {
 	Size        int64
 	CreatedAt   time.Time
 	ETag        string
+	// Attachment serves the asset as a download. Files must set it (rule
+	// 6). Any type but a raster image (JPEG, PNG, GIF, WebP, AVIF) is an
+	// attachment regardless, so SVG and HTML are never inline.
+	Attachment bool
+	// Filename is the name a download is saved as. Filenames never reach
+	// storage (rule 5), so the app supplies it here; setting it implies
+	// Attachment.
+	Filename string
 }
 
 // CacheKey returns the cache key for a, which deletion must also use.
@@ -68,11 +79,16 @@ type Config struct {
 	DebugHeader  string // header carrying the tier or "miss"; empty disables
 	OnServe      func(Event)
 	Limit        func(*http.Request) bool // true refuses with 429
+	// StreamAbove is the size in bytes above which an asset skips the
+	// cache and streams from storage, so large files don't sit in memory.
+	// The pool bounds opening the stream, not sending it. Default 16 MiB.
+	StreamAbove int64
 }
 
 const (
 	defaultConcurrency  = 16
 	defaultCacheControl = "private, max-age=1800, immutable"
+	defaultStreamAbove  = 16 << 20
 	fetchTimeout        = 30 * time.Second
 )
 
@@ -123,6 +139,9 @@ func New(cfg Config) http.Handler {
 	if cfg.CacheControl == "" {
 		cfg.CacheControl = defaultCacheControl
 	}
+	if cfg.StreamAbove <= 0 {
+		cfg.StreamAbove = defaultStreamAbove
+	}
 	return &handler{cfg: cfg, variants: vs, pool: cfg.Pool}
 }
 
@@ -169,6 +188,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if a.Size > h.cfg.StreamAbove {
+		h.stream(w, r, a, &ev)
+		return
+	}
+
 	key := a.CacheKey()
 	e, tier, ok := h.cfg.Cache.Get(key)
 	if !ok {
@@ -176,14 +200,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return h.fetch(ctx, a)
 		})
 		if err != nil {
-			switch {
-			case errors.Is(err, store.ErrNotFound):
-				ev.Status = notFound(w)
-			case r.Context().Err() != nil:
-				// Client went away; nothing to write.
-			default:
-				ev.Status = writePlain(w, http.StatusInternalServerError, "internal error\n")
-			}
+			h.fail(w, r, err, &ev)
 			return
 		}
 		tier = "miss"
@@ -194,22 +211,80 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ct == "" {
 		ct = e.ContentType
 	}
-	hd := w.Header()
-	hd.Set("Content-Type", ct)
-	hd.Set("Content-Length", strconv.Itoa(len(e.Data)))
-	hd.Set("ETag", etag)
-	hd.Set("Cache-Control", h.cfg.CacheControl)
-	hd.Set("X-Content-Type-Options", "nosniff")
-	if h.cfg.DebugHeader != "" {
-		hd.Set(h.cfg.DebugHeader, tier)
-	}
-	w.WriteHeader(http.StatusOK)
+	h.writeHeader(w, a, ct, int64(len(e.Data)), tier)
 	ev.Status = http.StatusOK
 	if r.Method == http.MethodHead {
 		return
 	}
 	n, _ := w.Write(e.Data)
 	ev.Bytes = int64(n)
+}
+
+// fail answers a failed fetch: NotFound for a missing object, nothing for
+// a client that went away, and 500 otherwise.
+func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error, ev *Event) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		ev.Status = notFound(w)
+	case r.Context().Err() != nil:
+		// Client went away; nothing to write.
+	default:
+		ev.Status = writePlain(w, http.StatusInternalServerError, "internal error\n")
+	}
+}
+
+// writeHeader writes a 200's headers. Every response is sandboxed and
+// nosniff; disposition says whether it may display inline.
+func (h *handler) writeHeader(w http.ResponseWriter, a Asset, ct string, size int64, tier string) {
+	hd := w.Header()
+	hd.Set("Content-Type", ct)
+	hd.Set("Content-Length", strconv.FormatInt(size, 10))
+	hd.Set("Content-Disposition", disposition(a, ct))
+	hd.Set("ETag", `"`+a.ETag+`"`)
+	hd.Set("Cache-Control", h.cfg.CacheControl)
+	hd.Set("X-Content-Type-Options", "nosniff")
+	hd.Set("Content-Security-Policy", "sandbox")
+	if h.cfg.DebugHeader != "" {
+		hd.Set(h.cfg.DebugHeader, tier)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// stream sends a large asset straight from storage, bypassing the cache.
+// A pool slot is held only while the object is opened.
+func (h *handler) stream(w http.ResponseWriter, r *http.Request, a Asset, ev *Event) {
+	ev.Tier = "stream"
+	rc, err := h.open(r.Context(), a)
+	if err != nil {
+		h.fail(w, r, err, ev)
+		return
+	}
+	defer rc.Close()
+	h.writeHeader(w, a, a.ContentType, a.Size, "stream")
+	ev.Status = http.StatusOK
+	if r.Method == http.MethodHead {
+		return
+	}
+	n, _ := io.CopyN(w, rc, a.Size)
+	ev.Bytes = n
+}
+
+func (h *handler) open(ctx context.Context, a Asset) (io.ReadCloser, error) {
+	select {
+	case h.pool.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-h.pool.sem }()
+	rc, info, err := h.cfg.Provider.Get(ctx, a.Bucket, a.Key)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size != a.Size {
+		rc.Close()
+		return nil, errSizeMismatch
+	}
+	return rc, nil
 }
 
 // fetch loads a from storage through the bounded pool.
@@ -236,6 +311,82 @@ func (h *handler) fetch(ctx context.Context, a Asset) (cache.Entry, error) {
 		return cache.Entry{}, errSizeMismatch
 	}
 	return cache.Entry{Data: data, ContentType: a.ContentType, ETag: a.ETag, Owner: a.Owner, CreatedAt: a.CreatedAt}, nil
+}
+
+// Delete removes a stored object the way rule 9 requires: it evicts key
+// from every cache tier, deletes it from storage, and evicts again, so a
+// fill that started in between can't keep it cached.
+func Delete(ctx context.Context, c *cache.Cache, p store.Provider, bucket, key string) error {
+	ck := Asset{Bucket: bucket, Key: key}.CacheKey()
+	c.Remove(ck)
+	err := p.Delete(ctx, bucket, key)
+	c.Remove(ck)
+	return err
+}
+
+// inlineTypes are the raster image types a browser may display inline.
+var inlineTypes = map[string]bool{
+	"image/jpeg": true, "image/png": true, "image/gif": true, "image/webp": true, "image/avif": true,
+}
+
+// disposition returns the Content-Disposition for a served as ct.
+func disposition(a Asset, ct string) string {
+	mt, _, err := mime.ParseMediaType(ct)
+	if !a.Attachment && a.Filename == "" && err == nil && inlineTypes[mt] {
+		return "inline"
+	}
+	name := cleanFilename(a.Filename)
+	if name == "" {
+		return "attachment"
+	}
+	v := `attachment; filename="` + asciiFilename(name) + `"`
+	if asciiFilename(name) != name {
+		v += "; filename*=UTF-8''" + encodeRFC5987(name)
+	}
+	return v
+}
+
+// cleanFilename drops path components and replaces control characters,
+// quotes and backslashes, so the name is safe in a header and on disk.
+func cleanFilename(s string) string {
+	if i := strings.LastIndexAny(s, `/\`); i >= 0 {
+		s = s[i+1:]
+	}
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' || r == utf8.RuneError {
+			return '_'
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if s == "." || s == ".." {
+		return ""
+	}
+	return s
+}
+
+// asciiFilename is the fallback filename= for clients without filename*.
+func asciiFilename(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r > 0x7e {
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// encodeRFC5987 percent-encodes s as an RFC 5987 ext-value.
+func encodeRFC5987(s string) string {
+	const attr = "!#$&+-.^_`|~"
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte(attr, c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 // notFound writes the one refusal every cause shares.
