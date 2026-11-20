@@ -176,7 +176,8 @@ func (p *Provider) Get(ctx context.Context, b, key string) (io.ReadCloser, store
 	return readCloser{r, f}, info, nil
 }
 
-// Delete removes the object; a missing one is not an error.
+// Delete removes the object; a missing one is not an error. Empty parent
+// directories stay, and DeleteBucket ignores them.
 func (p *Provider) Delete(ctx context.Context, b, key string) error {
 	_, dst, err := p.path(b, key)
 	if err != nil {
@@ -184,6 +185,42 @@ func (p *Provider) Delete(ctx context.Context, b, key string) error {
 	}
 	if err := os.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("fs: delete %s/%s: %w", b, key, err)
+	}
+	return nil
+}
+
+// DeleteBucket removes root/<bucket> when it holds no objects. Leftover
+// temp files from interrupted Puts don't count, and neither do empty
+// directories. A missing bucket is not an error.
+func (p *Provider) DeleteBucket(ctx context.Context, name string) error {
+	dir, err := p.bucketDir(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	tmp := filepath.Join(dir, tmpDir)
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == tmp && d.IsDir() {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() {
+			return store.ErrBucketNotEmpty
+		}
+		return nil
+	})
+	if errors.Is(err, store.ErrBucketNotEmpty) {
+		return fmt.Errorf("fs: delete bucket %s: %w", name, err)
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("fs: delete bucket %s: %w", name, err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("fs: delete bucket %s: %w", name, err)
 	}
 	return nil
 }

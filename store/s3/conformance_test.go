@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -20,14 +21,20 @@ import (
 	"github.com/Kolonnade/Poikile/store/s3"
 )
 
-// TestConformance runs the suite against real S3. It creates a
-// bucket named TEST_S3_BUCKET_PREFIX (default poikile-test-) plus a random
-// suffix and removes it, and every object version
-// in it, when done.
+// TestConformance runs the suite against real S3, or against an
+// S3-compatible endpoint such as a local MinIO. It creates a bucket named
+// TEST_S3_BUCKET_PREFIX (default poikile-test-) plus a random suffix and
+// removes it, and every object version in it, when done.
+//
+// TEST_S3_PROFILE names an AWS profile. Or TEST_S3_ENDPOINT,
+// TEST_S3_ACCESS_KEY and TEST_S3_SECRET_KEY name an endpoint and static
+// credentials; then template steps the server does not implement are
+// skipped (Options.AllowUnsupported), as a local dev setup would.
 func TestConformance(t *testing.T) {
 	profile := os.Getenv("TEST_S3_PROFILE")
-	if profile == "" {
-		t.Skip("TEST_S3_PROFILE not set")
+	endpoint := os.Getenv("TEST_S3_ENDPOINT")
+	if profile == "" && endpoint == "" {
+		t.Skip("neither TEST_S3_PROFILE nor TEST_S3_ENDPOINT set")
 	}
 	region := os.Getenv("TEST_S3_REGION")
 	if region == "" {
@@ -49,15 +56,34 @@ func TestConformance(t *testing.T) {
 	}
 	t.Logf("bucket %s", name)
 
-	p, err := s3.FromProfile(ctx, profile, region, "")
-	if err != nil {
-		t.Fatal(err)
+	var p *s3.Provider
+	var admin *awss3.Client
+	if endpoint != "" {
+		ak, sk := os.Getenv("TEST_S3_ACCESS_KEY"), os.Getenv("TEST_S3_SECRET_KEY")
+		var err error
+		p, err = s3.FromStatic(endpoint, ak, sk, s3.Options{Region: region, AllowUnsupported: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		admin = awss3.New(awss3.Options{
+			Region:       region,
+			Credentials:  credentials.NewStaticCredentialsProvider(ak, sk, ""),
+			BaseEndpoint: aws.String(endpoint),
+			UsePathStyle: true,
+		})
+	} else {
+		var err error
+		p, err = s3.FromProfile(ctx, profile, region, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile), config.WithRegion(region))
+		if err != nil {
+			t.Fatal(err)
+		}
+		admin = awss3.NewFromConfig(cfg)
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile), config.WithRegion(region))
-	if err != nil {
-		t.Fatal(err)
-	}
-	admin := awss3.NewFromConfig(cfg)
+	strict := endpoint == ""
 
 	// Registered before Provider: cleanups run LIFO, so the suite's own
 	// object deletes run first, then this removes every remaining version
@@ -84,7 +110,7 @@ func TestConformance(t *testing.T) {
 		Uploads:  true,
 		OnKey:    func(k string) { keys = append(keys, k) },
 		CheckTemplate: func(t *testing.T, name string, tmpl bucket.Template) {
-			checkTemplate(t, ctx, admin, name, tmpl)
+			checkTemplate(t, ctx, admin, name, tmpl, strict)
 		},
 		// ListDenied is nil: the suite runs as admin, which may list.
 		ListDenied: nil,
@@ -122,13 +148,25 @@ func purgeKey(t *testing.T, ctx context.Context, c *awss3.Client, b, key string)
 	t.Errorf("purge %s/%s: versions remain after 10 deletes (remove by hand)", b, key)
 }
 
-func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name string, tmpl bucket.Template) {
+// checkTemplate reads every template step back. When strict is false (an
+// S3-compatible dev server), the steps Options.AllowUnsupported may skip
+// (public access block, encryption, CORS) are logged instead of failing if
+// they can't be read back; versioning and lifecycle are always checked.
+func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name string, tmpl bucket.Template, strict bool) {
 	t.Helper()
 	b := aws.String(name)
+	failed := func(step string, err error) {
+		t.Helper()
+		if !strict && step != "versioning" && step != "lifecycle" {
+			t.Logf("%s: not applied by this server, skipped: %v", step, err)
+			return
+		}
+		t.Errorf("%s: %v", step, err)
+	}
 
 	pab, err := c.GetPublicAccessBlock(ctx, &awss3.GetPublicAccessBlockInput{Bucket: b})
 	if err != nil {
-		t.Errorf("public access block: %v", err)
+		failed("public access block", err)
 	} else {
 		pc := pab.PublicAccessBlockConfiguration
 		if pc == nil || !aws.ToBool(pc.BlockPublicAcls) || !aws.ToBool(pc.IgnorePublicAcls) ||
@@ -140,7 +178,7 @@ func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name stri
 
 	enc, err := c.GetBucketEncryption(ctx, &awss3.GetBucketEncryptionInput{Bucket: b})
 	if err != nil {
-		t.Errorf("encryption: %v", err)
+		failed("encryption", err)
 	} else {
 		ok := false
 		if sc := enc.ServerSideEncryptionConfiguration; sc != nil {
@@ -158,7 +196,7 @@ func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name stri
 
 	ver, err := c.GetBucketVersioning(ctx, &awss3.GetBucketVersioningInput{Bucket: b})
 	if err != nil {
-		t.Errorf("versioning: %v", err)
+		failed("versioning", err)
 	} else {
 		if ver.Status != types.BucketVersioningStatusEnabled {
 			t.Errorf("versioning = %q, want Enabled", ver.Status)
@@ -168,7 +206,7 @@ func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name stri
 
 	lc, err := c.GetBucketLifecycleConfiguration(ctx, &awss3.GetBucketLifecycleConfigurationInput{Bucket: b})
 	if err != nil {
-		t.Errorf("lifecycle: %v", err)
+		failed("lifecycle", err)
 	} else {
 		var nonc, inc bool
 		for _, r := range lc.Rules {
@@ -192,7 +230,7 @@ func checkTemplate(t *testing.T, ctx context.Context, c *awss3.Client, name stri
 
 	cors, err := c.GetBucketCors(ctx, &awss3.GetBucketCorsInput{Bucket: b})
 	if err != nil {
-		t.Errorf("cors: %v", err)
+		failed("cors", err)
 	} else {
 		if len(cors.CORSRules) != 1 {
 			t.Errorf("cors: %d rules, want 1", len(cors.CORSRules))

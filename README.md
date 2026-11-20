@@ -37,6 +37,18 @@ Import path: `github.com/Kolonnade/Poikile`.
 
 Import these; don't copy them. If you need something that isn't exported, open an issue asking for a public API.
 
+## Deleting a bucket
+
+`DeleteBucket` removes an empty bucket, for when its owner goes (a room, say). Nothing lists a bucket, so the app empties it first: it deletes every key its database knows, including the `incoming/` keys of uploads it signed, each after evicting it from the cache (rule 9), and then calls `DeleteBucket`. A bucket that still holds anything returns `store.ErrBucketNotEmpty`. A missing bucket is not an error, so a deletion job can stop and resume.
+
+Every bucket is versioned, so on S3 `Delete` removes a key for good: it asks `HeadObject` for the current version or delete marker and deletes it by id until the key is gone, without listing. Versioning still keeps what an overwrite replaces, until `Delete` or `NoncurrentDays`.
+
+## IAM
+
+The role that runs `EnsureBucket` needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, `s3:PutEncryptionConfiguration`, `s3:PutBucketVersioning`, `s3:PutLifecycleConfiguration`, `s3:PutBucketCORS` and, with a `LogBucket`, `s3:PutBucketLogging`. `DeleteBucket` needs `s3:DeleteBucket`.
+
+The runtime role needs `s3:PutObject` and `s3:GetObject` (which `HeadObject` uses too), and `s3:DeleteObject` and `s3:DeleteObjectVersion` for `Delete`. It never gets `s3:ListBucket` (rule 4).
+
 ## Rules
 
 1. No storage URL ever reaches a client, except an upload target.
@@ -51,7 +63,13 @@ Import these; don't copy them. If you need something that isn't exported, open a
 
 ## Tests
 
-`go test ./...` runs everything that needs no network. The S3 conformance test runs only when `TEST_S3_PROFILE` names an AWS profile; `TEST_S3_REGION` (default `us-east-1`) and `TEST_S3_BUCKET_PREFIX` (default `poikile-test-`) set where it creates its temporary bucket.
+`go test ./...` runs everything that needs no network. The S3 conformance test runs only when `TEST_S3_PROFILE` names an AWS profile, or when `TEST_S3_ENDPOINT`, `TEST_S3_ACCESS_KEY` and `TEST_S3_SECRET_KEY` name an S3-compatible server such as a local MinIO; `TEST_S3_REGION` (default `us-east-1`) and `TEST_S3_BUCKET_PREFIX` (default `poikile-test-`) set where it creates its temporary bucket.
+
+```sh
+TEST_S3_ENDPOINT=http://127.0.0.1:9000 TEST_S3_ACCESS_KEY=... TEST_S3_SECRET_KEY=... go test ./store/s3/
+```
+
+Against an endpoint the test sets `s3.Options.AllowUnsupported`, as a local dev setup should: MinIO doesn't implement the public access block, CORS, access logging, or encryption without a KMS, so `EnsureBucket` skips those steps there. Versioning and lifecycle are always applied. Leave `AllowUnsupported` off on AWS.
 
 HEIF decoding needs libheif and the `heif` build tag: `go test -tags heif ./...`. The HEIC test reads `process/image/testdata/sample.heic` and skips without it; make one with `heif-enc`.
 

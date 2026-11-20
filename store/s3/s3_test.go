@@ -39,6 +39,11 @@ type stubAPI struct {
 	logging   *awss3.PutBucketLoggingInput
 	put       *awss3.PutObjectInput
 	getOut    *awss3.GetObjectOutput
+	putOpts   int
+	// versions is the one key's version stack, current last; deleted
+	// records the version ids DeleteObject was called with.
+	versions []string
+	deleted  []string
 }
 
 func (s *stubAPI) call(name string) error {
@@ -71,8 +76,9 @@ func (s *stubAPI) PutBucketLogging(_ context.Context, in *awss3.PutBucketLogging
 	s.logging = in
 	return &awss3.PutBucketLoggingOutput{}, s.call("PutBucketLogging")
 }
-func (s *stubAPI) PutObject(_ context.Context, in *awss3.PutObjectInput, _ ...func(*awss3.Options)) (*awss3.PutObjectOutput, error) {
+func (s *stubAPI) PutObject(_ context.Context, in *awss3.PutObjectInput, opts ...func(*awss3.Options)) (*awss3.PutObjectOutput, error) {
 	s.put = in
+	s.putOpts = len(opts)
 	return &awss3.PutObjectOutput{}, s.call("PutObject")
 }
 func (s *stubAPI) GetObject(_ context.Context, _ *awss3.GetObjectInput, _ ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
@@ -81,8 +87,28 @@ func (s *stubAPI) GetObject(_ context.Context, _ *awss3.GetObjectInput, _ ...fun
 	}
 	return s.getOut, nil
 }
-func (s *stubAPI) DeleteObject(_ context.Context, _ *awss3.DeleteObjectInput, _ ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error) {
-	return &awss3.DeleteObjectOutput{}, s.call("DeleteObject")
+func (s *stubAPI) DeleteObject(_ context.Context, in *awss3.DeleteObjectInput, _ ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error) {
+	if err := s.call("DeleteObject"); err != nil {
+		return nil, err
+	}
+	s.deleted = append(s.deleted, aws.ToString(in.VersionId))
+	if n := len(s.versions); n > 0 && s.versions[n-1] == aws.ToString(in.VersionId) {
+		s.versions = s.versions[:n-1]
+	}
+	return &awss3.DeleteObjectOutput{}, nil
+}
+
+func (s *stubAPI) HeadObject(_ context.Context, in *awss3.HeadObjectInput, _ ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
+	if err := s.call("HeadObject"); err != nil {
+		return nil, err
+	}
+	if len(s.versions) == 0 {
+		return nil, notFoundHTTP(404)
+	}
+	return &awss3.HeadObjectOutput{VersionId: aws.String(s.versions[len(s.versions)-1])}, nil
+}
+func (s *stubAPI) DeleteBucket(_ context.Context, _ *awss3.DeleteBucketInput, _ ...func(*awss3.Options)) (*awss3.DeleteBucketOutput, error) {
+	return &awss3.DeleteBucketOutput{}, s.call("DeleteBucket")
 }
 
 type stubPresigner struct {
@@ -356,10 +382,180 @@ func TestPutNoBucket(t *testing.T) {
 }
 
 func TestDeleteMissingIsNil(t *testing.T) {
+	for name, err := range map[string]error{
+		"404":          notFoundHTTP(404),
+		"403":          notFoundHTTP(403),
+		"NoSuchBucket": &smithy.GenericAPIError{Code: "NoSuchBucket"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, a, _ := newStub("")
+			a.errs["HeadObject"] = err
+			if err := p.Delete(context.Background(), testBucket, "photos/"+testUUID+"/thumb"); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(a.calls, []string{"HeadObject"}) {
+				t.Fatalf("calls = %v", a.calls)
+			}
+		})
+	}
+}
+
+func TestDeleteRemovesEveryVersion(t *testing.T) {
 	p, a, _ := newStub("")
-	a.errs["DeleteObject"] = &smithy.GenericAPIError{Code: "NoSuchKey"}
+	a.versions = []string{"v1", "v2", "v3"}
 	if err := p.Delete(context.Background(), testBucket, "photos/"+testUUID+"/thumb"); err != nil {
 		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a.deleted, []string{"v3", "v2", "v1"}) || len(a.versions) != 0 {
+		t.Fatalf("deleted = %v, left = %v", a.deleted, a.versions)
+	}
+}
+
+func TestDeleteRemovesDeleteMarker(t *testing.T) {
+	p, a, _ := newStub("")
+	marker := notFoundHTTP(404).(*awshttp.ResponseError)
+	marker.Response.Header = http.Header{"X-Amz-Delete-Marker": {"true"}, "X-Amz-Version-Id": {"m1"}}
+	a.errs["HeadObject"] = marker
+	a.versions = []string{"v1"}
+	var calls int
+	// HeadObject reports the marker once; after it is deleted, v1 is current.
+	p.api = &markerOnce{stubAPI: a, marker: marker, calls: &calls}
+	if err := p.Delete(context.Background(), testBucket, "photos/"+testUUID+"/thumb"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a.deleted, []string{"m1", "v1"}) {
+		t.Fatalf("deleted = %v", a.deleted)
+	}
+}
+
+type markerOnce struct {
+	*stubAPI
+	marker error
+	calls  *int
+}
+
+func (m *markerOnce) HeadObject(ctx context.Context, in *awss3.HeadObjectInput, o ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
+	*m.calls++
+	if *m.calls == 1 {
+		return nil, m.marker
+	}
+	delete(m.errs, "HeadObject")
+	return m.stubAPI.HeadObject(ctx, in, o...)
+}
+
+func TestDeleteUnversioned(t *testing.T) {
+	p, a, _ := newStub("")
+	a.versions = []string{""}
+	if err := p.Delete(context.Background(), testBucket, "photos/"+testUUID+"/thumb"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a.calls, []string{"HeadObject", "DeleteObject"}) || !reflect.DeepEqual(a.deleted, []string{""}) {
+		t.Fatalf("calls = %v, deleted = %v", a.calls, a.deleted)
+	}
+}
+
+func TestDeleteTooManyVersions(t *testing.T) {
+	p, a, _ := newStub("")
+	p.api = &stuckVersion{a}
+	if err := p.Delete(context.Background(), testBucket, "photos/"+testUUID+"/thumb"); err == nil {
+		t.Fatal("no error for a version that never goes away")
+	}
+}
+
+type stuckVersion struct{ *stubAPI }
+
+func (s *stuckVersion) HeadObject(context.Context, *awss3.HeadObjectInput, ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
+	return &awss3.HeadObjectOutput{VersionId: aws.String("v")}, nil
+}
+
+func TestDeleteBucket(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		notEmpty bool
+		fails    bool
+	}{
+		{"deleted", nil, false, false},
+		{"missing", &smithy.GenericAPIError{Code: "NoSuchBucket"}, false, false},
+		{"404", notFoundHTTP(404), false, false},
+		{"not empty", &smithy.GenericAPIError{Code: "BucketNotEmpty"}, true, true},
+		{"denied", &smithy.GenericAPIError{Code: "AccessDenied"}, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, a, _ := newStub("")
+			a.errs["DeleteBucket"] = tt.err
+			err := p.DeleteBucket(context.Background(), testBucket)
+			if (err != nil) != tt.fails || errors.Is(err, store.ErrBucketNotEmpty) != tt.notEmpty {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	p, a, _ := newStub("")
+	if p.DeleteBucket(context.Background(), "Bad_Bucket") == nil || len(a.calls) != 0 {
+		t.Fatalf("bad name: calls = %v", a.calls)
+	}
+}
+
+func TestEnsureBucketAllowUnsupported(t *testing.T) {
+	notImpl := &smithy.GenericAPIError{Code: "NotImplemented"}
+	malformed := &smithy.GenericAPIError{Code: "MalformedXML"}
+	tpl := bucket.Baseline("https://app.example")
+	tpl.LogBucket = "acme-logs"
+	set := func(a *stubAPI) {
+		a.errs["PutPublicAccessBlock"] = malformed
+		a.errs["PutBucketEncryption"] = notImpl
+		a.errs["PutBucketCors"] = notImpl
+		a.errs["PutBucketLogging"] = malformed
+	}
+
+	p, a, _ := newStub("")
+	set(a)
+	if err := p.EnsureBucket(context.Background(), testBucket, tpl); err == nil {
+		t.Fatal("strict: unsupported step accepted")
+	}
+
+	p, a, _ = newStub("")
+	p.opts.AllowUnsupported = true
+	set(a)
+	if err := p.EnsureBucket(context.Background(), testBucket, tpl); err != nil {
+		t.Fatalf("allowed: %v", err)
+	}
+	if !reflect.DeepEqual(a.calls, allSteps) {
+		t.Fatalf("calls = %v", a.calls)
+	}
+
+	for _, step := range []string{"PutBucketVersioning", "PutBucketLifecycleConfiguration"} {
+		p, a, _ = newStub("")
+		p.opts.AllowUnsupported = true
+		a.errs[step] = notImpl
+		if err := p.EnsureBucket(context.Background(), testBucket, tpl); err == nil {
+			t.Fatalf("%s skipped; it never may be", step)
+		}
+	}
+	p, a, _ = newStub("")
+	p.opts.AllowUnsupported = true
+	a.errs["PutBucketCors"] = errors.New("boom")
+	if err := p.EnsureBucket(context.Background(), testBucket, tpl); err == nil {
+		t.Fatal("a real error was skipped")
+	}
+}
+
+func TestPutStreamIsUnsigned(t *testing.T) {
+	p, a, _ := newStub("")
+	ctx := context.Background()
+	key := "files/" + testUUID + "/file"
+	if err := p.Put(ctx, testBucket, key, strings.NewReader("x"), store.ObjectInfo{Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if a.putOpts != 0 {
+		t.Fatalf("seekable body: %d options", a.putOpts)
+	}
+	if err := p.Put(ctx, testBucket, key, io.MultiReader(strings.NewReader("x")), store.ObjectInfo{Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if a.putOpts != 1 {
+		t.Fatalf("stream: %d options", a.putOpts)
 	}
 }
 

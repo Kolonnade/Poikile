@@ -185,6 +185,23 @@ func Provider(t *testing.T, p store.Provider, o Options) {
 		wantNotFound(t, ctx, p, o.Bucket, k)
 	})
 
+	t.Run("OverwriteThenDelete", func(t *testing.T) {
+		t.Logf("put a key twice, delete it once: no version may remain")
+		k := objectKey(t)
+		for i, b := range []string{"first", "second"} {
+			if err := p.Put(ctx, o.Bucket, k, bytes.NewReader([]byte(b)), store.ObjectInfo{ContentType: "text/plain", Size: int64(len(b))}); err != nil {
+				t.Fatalf("Put #%d %s: %v", i+1, k, err)
+			}
+		}
+		if got, _ := mustGet(t, ctx, p, o.Bucket, k); string(got) != "second" {
+			t.Errorf("Get %s = %q, want second", k, got)
+		}
+		if err := p.Delete(ctx, o.Bucket, k); err != nil {
+			t.Fatalf("Delete %s: %v", k, err)
+		}
+		wantNotFound(t, ctx, p, o.Bucket, k)
+	})
+
 	t.Run("ListDenied", func(t *testing.T) {
 		if o.ListDenied == nil {
 			t.Skip("no list check for these credentials")
@@ -192,6 +209,42 @@ func Provider(t *testing.T, p store.Provider, o Options) {
 		t.Logf("listing the bucket must be refused")
 		if err := o.ListDenied(); err != nil {
 			t.Errorf("ListDenied: %v", err)
+		}
+	})
+
+	// Last, since it removes the bucket: a bucket with an object in it is
+	// refused; once every key the suite made is deleted (as an app deletes
+	// each key it knows), it goes, and deleting it again is not an error.
+	t.Run("DeleteBucket", func(t *testing.T) {
+		k := objectKey(t)
+		if err := p.Put(ctx, o.Bucket, k, bytes.NewReader([]byte("x")), store.ObjectInfo{ContentType: "text/plain", Size: 1}); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+		t.Logf("delete the bucket with an object in it")
+		if err := p.DeleteBucket(ctx, o.Bucket); !errors.Is(err, store.ErrBucketNotEmpty) {
+			t.Fatalf("DeleteBucket with an object: %v, want ErrBucketNotEmpty", err)
+		}
+		if _, _, err := p.Get(ctx, o.Bucket, k); err != nil {
+			t.Fatalf("Get %s after the refused DeleteBucket: %v", k, err)
+		}
+		t.Logf("delete all %d keys the suite made, then the bucket, twice", len(created))
+		for _, c := range created {
+			if err := p.Delete(ctx, o.Bucket, c); err != nil {
+				t.Fatalf("Delete %s: %v", c, err)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			if err := p.DeleteBucket(ctx, o.Bucket); err != nil {
+				t.Fatalf("DeleteBucket #%d: %v", i+1, err)
+			}
+		}
+		wantNotFound(t, ctx, p, o.Bucket, k)
+		if err := p.Put(ctx, o.Bucket, k, bytes.NewReader([]byte("x")), store.ObjectInfo{ContentType: "text/plain", Size: 1}); !errors.Is(err, store.ErrNoBucket) {
+			t.Errorf("Put after DeleteBucket: %v, want ErrNoBucket", err)
+		}
+		t.Logf("ensure the bucket again: a deleted room's bucket name can be reused")
+		if err := p.EnsureBucket(ctx, o.Bucket, o.Template); err != nil {
+			t.Fatalf("EnsureBucket after DeleteBucket: %v", err)
 		}
 	})
 }

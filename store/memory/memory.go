@@ -108,3 +108,21 @@ func (p *Provider) SignUpload(ctx context.Context, b, key string, lim upload.Lim
 		Expires: time.Now().Add(lim.TTL),
 	}, nil
 }
+
+// DeleteBucket removes an empty bucket; a missing one is not an error.
+func (p *Provider) DeleteBucket(ctx context.Context, name string) error {
+	if err := bucket.ValidateName(name); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	objs, ok := p.buckets[name]
+	if !ok {
+		return nil
+	}
+	if len(objs) > 0 {
+		return fmt.Errorf("memory: delete bucket %s: %w", name, store.ErrBucketNotEmpty)
+	}
+	delete(p.buckets, name)
+	return nil
+}

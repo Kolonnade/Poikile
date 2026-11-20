@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 
@@ -19,7 +21,8 @@ import (
 )
 
 // api is the subset of *awss3.Client the provider uses. It has no List or
-// HeadBucket on purpose: keys come from the app's database.
+// HeadBucket on purpose: keys come from the app's database. HeadObject
+// names a key's current version so Delete can remove it by id.
 type api interface {
 	CreateBucket(ctx context.Context, params *awss3.CreateBucketInput, optFns ...func(*awss3.Options)) (*awss3.CreateBucketOutput, error)
 	PutPublicAccessBlock(ctx context.Context, params *awss3.PutPublicAccessBlockInput, optFns ...func(*awss3.Options)) (*awss3.PutPublicAccessBlockOutput, error)
@@ -31,6 +34,8 @@ type api interface {
 	PutObject(ctx context.Context, params *awss3.PutObjectInput, optFns ...func(*awss3.Options)) (*awss3.PutObjectOutput, error)
 	GetObject(ctx context.Context, params *awss3.GetObjectInput, optFns ...func(*awss3.Options)) (*awss3.GetObjectOutput, error)
 	DeleteObject(ctx context.Context, params *awss3.DeleteObjectInput, optFns ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error)
+	HeadObject(ctx context.Context, params *awss3.HeadObjectInput, optFns ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error)
+	DeleteBucket(ctx context.Context, params *awss3.DeleteBucketInput, optFns ...func(*awss3.Options)) (*awss3.DeleteBucketOutput, error)
 }
 
 // presigner signs browser uploads. Only POST: no GET or PUT pre-signing.
@@ -45,6 +50,11 @@ type Options struct {
 	Region string
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// AllowUnsupported is for local S3-compatible dev servers such as
+	// MinIO: an EnsureBucket step the server answers with NotImplemented
+	// is skipped instead of failing. Leave it false on AWS, where every
+	// step must apply.
+	AllowUnsupported bool
 }
 
 // Provider is a store.Provider on S3 or an S3-compatible endpoint.
@@ -94,6 +104,25 @@ func FromProfile(ctx context.Context, profile, region, endpoint string) (*Provid
 	return New(client, Options{Region: cfg.Region}), nil
 }
 
+// FromStatic builds a Provider for an S3-compatible endpoint, such as a
+// local MinIO, with static credentials and path-style addressing. An empty
+// o.Region means us-east-1.
+func FromStatic(endpoint, accessKey, secretKey string, o Options) (*Provider, error) {
+	if endpoint == "" || accessKey == "" || secretKey == "" {
+		return nil, errors.New("s3: endpoint, access key and secret key are required")
+	}
+	if o.Region == "" {
+		o.Region = "us-east-1"
+	}
+	client := awss3.New(awss3.Options{
+		Region:       o.Region,
+		Credentials:  credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+		BaseEndpoint: aws.String(endpoint),
+		UsePathStyle: true,
+	})
+	return New(client, o), nil
+}
+
 // Get opens an object. A missing bucket or key returns store.ErrNotFound.
 func (p *Provider) Get(ctx context.Context, b, key string) (io.ReadCloser, store.ObjectInfo, error) {
 	if err := store.ValidKey(key); err != nil {
@@ -121,7 +150,14 @@ func (p *Provider) Put(ctx context.Context, b, key string, body io.Reader, info 
 	if info.Size > 0 {
 		in.ContentLength = aws.Int64(info.Size)
 	}
-	if _, err := p.api.PutObject(ctx, in); err != nil {
+	var opts []func(*awss3.Options)
+	if _, ok := body.(io.Seeker); !ok {
+		// A stream can't be hashed before it is sent, so sign it as
+		// UNSIGNED-PAYLOAD; without this the SDK refuses it over plain
+		// HTTP (a local MinIO).
+		opts = append(opts, awss3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware))
+	}
+	if _, err := p.api.PutObject(ctx, in, opts...); err != nil {
 		if noBucket(err) {
 			return fmt.Errorf("s3: put %s/%s: %w", b, key, store.ErrNoBucket)
 		}
@@ -130,18 +166,65 @@ func (p *Provider) Put(ctx context.Context, b, key string, body io.Reader, info 
 	return nil
 }
 
-// Delete removes an object; a missing one is not an error.
+// maxVersions bounds how many versions of one key Delete removes.
+const maxVersions = 100
+
+// Delete removes an object permanently; a missing one is not an error. The
+// bucket is versioned, so a plain DeleteObject would only add a delete
+// marker and the bucket could never be emptied. Instead Delete asks
+// HeadObject for the current version (or delete marker) and deletes it by
+// id, until the key is plainly absent. It never lists. A deleted object
+// can't be restored from S3; versioning still keeps what an overwrite
+// replaces, until Delete or NoncurrentDays.
 func (p *Provider) Delete(ctx context.Context, b, key string) error {
 	if err := store.ValidKey(key); err != nil {
 		return err
 	}
-	if _, err := p.api.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(b), Key: aws.String(key)}); err != nil {
-		if notFound(err) {
+	for range maxVersions {
+		vid, ok, err := p.currentVersion(ctx, b, key)
+		if err != nil {
+			return fmt.Errorf("s3: delete %s/%s: %w", b, key, err)
+		}
+		if !ok {
 			return nil
 		}
-		return fmt.Errorf("s3: delete %s/%s: %w", b, key, err)
+		in := &awss3.DeleteObjectInput{Bucket: aws.String(b), Key: aws.String(key), VersionId: vid}
+		if _, err := p.api.DeleteObject(ctx, in); err != nil {
+			if notFound(err) {
+				return nil
+			}
+			return fmt.Errorf("s3: delete %s/%s: %w", b, key, err)
+		}
+		if vid == nil {
+			// Unversioned: the plain delete removed it.
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("s3: delete %s/%s: more than %d versions", b, key, maxVersions)
+}
+
+// currentVersion returns the id of key's current version or delete marker
+// (nil when the bucket is unversioned), and false when nothing is there. A
+// 403 without a delete marker counts as absent, as in Get (see denied).
+func (p *Provider) currentVersion(ctx context.Context, b, key string) (*string, bool, error) {
+	out, err := p.api.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(b), Key: aws.String(key)})
+	if err == nil {
+		vid := out.VersionId
+		if aws.ToString(vid) == "" {
+			vid = nil
+		}
+		return vid, true, nil
+	}
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.Response != nil && re.Response.Header.Get("x-amz-delete-marker") == "true" {
+		if vid := re.Response.Header.Get("x-amz-version-id"); vid != "" {
+			return aws.String(vid), true, nil
+		}
+	}
+	if notFound(err) || denied(err) {
+		return nil, false, nil
+	}
+	return nil, false, err
 }
 
 func notFound(err error) bool {
