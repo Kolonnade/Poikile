@@ -254,13 +254,17 @@ func (h *handler) writeHeader(w http.ResponseWriter, a Asset, ct string, size in
 // A pool slot is held only while the object is opened.
 func (h *handler) stream(w http.ResponseWriter, r *http.Request, a Asset, ev *Event) {
 	ev.Tier = "stream"
-	rc, err := h.open(r.Context(), a)
+	rc, info, err := h.open(r.Context(), a)
 	if err != nil {
 		h.fail(w, r, err, ev)
 		return
 	}
 	defer rc.Close()
-	h.writeHeader(w, a, a.ContentType, a.Size, "stream")
+	ct := a.ContentType
+	if ct == "" {
+		ct = info.ContentType
+	}
+	h.writeHeader(w, a, ct, a.Size, "stream")
 	ev.Status = http.StatusOK
 	if r.Method == http.MethodHead {
 		return
@@ -269,22 +273,22 @@ func (h *handler) stream(w http.ResponseWriter, r *http.Request, a Asset, ev *Ev
 	ev.Bytes = n
 }
 
-func (h *handler) open(ctx context.Context, a Asset) (io.ReadCloser, error) {
+func (h *handler) open(ctx context.Context, a Asset) (io.ReadCloser, store.ObjectInfo, error) {
 	select {
 	case h.pool.sem <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, store.ObjectInfo{}, ctx.Err()
 	}
 	defer func() { <-h.pool.sem }()
 	rc, info, err := h.cfg.Provider.Get(ctx, a.Bucket, a.Key)
 	if err != nil {
-		return nil, err
+		return nil, info, err
 	}
 	if info.Size != a.Size {
 		rc.Close()
-		return nil, errSizeMismatch
+		return nil, info, errSizeMismatch
 	}
-	return rc, nil
+	return rc, info, nil
 }
 
 // fetch loads a from storage through the bounded pool.
